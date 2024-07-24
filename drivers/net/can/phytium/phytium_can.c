@@ -4,8 +4,14 @@
  * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
  */
 
+#include "linux/gfp.h"
+#include <linux/netlink.h>
+#include "linux/printk.h"
+#include "linux/stddef.h"
 #include <linux/bitfield.h>
-
+#include <linux/cdev.h>
+#include <linux/workqueue.h>
+#include <net/netlink.h>
 #include "phytium_can.h"
 
 /* register definition */
@@ -239,6 +245,12 @@ enum phytium_can_reg {
 /* CANFD Standard msg padding 1 */
 #define CANFD_IDR_PAD_MASK	0x000007FF
 #define CAN_IDR_PAD_MASK	0x00003FFF	/* Standard msg padding 1 */
+
+struct sock *nl_sk = NULL;
+#define NETLINK_TEST 26
+struct close_driver_work {
+	struct work_struct work;
+};
 
 /**
  * phytium_can_set_reg_bits - set a bit value to the device register
@@ -618,7 +630,6 @@ static void phytium_can_tx_interrupt(struct net_device *ndev, u32 isr)
 				 INTR_PWIE | INTR_PEIE));
 
 	can_led_event(ndev, CAN_LED_EVENT_TX);
-
 }
 
 static void phytium_can_tx_done_timeout(struct timer_list *t)
@@ -643,6 +654,44 @@ static void phytium_can_tx_done_timeout(struct timer_list *t)
 			mod_timer(&priv->timer, jiffies + HZ / 4);
 		}
 	}
+}
+
+static void defer_notify_user_via_netlink_worker(struct work_struct *work)
+{
+	struct sk_buff *nl_skb;
+	struct nlmsghdr *nlh;
+	int ret;
+	int len = NLMSG_SPACE(16);
+	nl_skb = nlmsg_new(len, GFP_KERNEL);
+	if (!nl_skb) {
+		printk("netlink alloc failure\n");
+		return;
+	}
+
+	// TODO: currently, we did not put any information inside the buffer.
+	nlh = nlmsg_put(nl_skb, 0, 0, NETLINK_TEST, len, 0);
+	if (nlh == NULL) {
+		printk("nlmsg_put failaure \n");
+		nlmsg_free(nl_skb);
+		return;
+	}
+
+	// user program should listen to port id = 4096
+	ret = netlink_unicast(nl_sk, nl_skb, 4096, MSG_DONTWAIT);
+	pr_info("send unicast:%d", ret);
+}
+
+static void defer_notify_user_via_netlink(struct net_device *ndev)
+{
+	int ret;
+	struct close_driver_work *my_work;
+	my_work = kmalloc(sizeof(*my_work), GFP_ATOMIC);
+	if (!my_work) {
+		printk(KERN_ERR "Failed to allocate memory for work struct\n");
+	}
+
+	INIT_WORK(&my_work->work, defer_notify_user_via_netlink_worker);
+	ret = schedule_work(&my_work->work);
 }
 
 static void phytium_can_err_interrupt(struct net_device *ndev, u32 isr)
@@ -680,8 +729,7 @@ static void phytium_can_err_interrupt(struct net_device *ndev, u32 isr)
 		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_EIC);
 		if (skb) {
 			cf->can_id |= CAN_ERR_CRTL;
-			cf->data[1] = (rxerr > 127) ?
-					CAN_ERR_CRTL_RX_PASSIVE :
+			cf->data[1] = (rxerr > 127) ? CAN_ERR_CRTL_RX_PASSIVE :
 					CAN_ERR_CRTL_TX_PASSIVE;
 			cf->data[6] = txerr;
 			cf->data[7] = rxerr;
@@ -699,6 +747,17 @@ static void phytium_can_err_interrupt(struct net_device *ndev, u32 isr)
 			cf->data[1] |= (txerr > rxerr) ?
 					CAN_ERR_CRTL_TX_WARNING :
 					CAN_ERR_CRTL_RX_WARNING;
+			cf->data[6] = txerr;
+			cf->data[7] = rxerr;
+		}
+	} else if (isr & INTR_EIS) {
+		/* Leave device in Config Mode in bus-off state */
+		defer_notify_user_via_netlink(ndev);
+		if (skb) {
+			cf->can_id |= CAN_ERR_CRTL;
+			cf->data[1] |= (txerr > rxerr) ?
+					       CAN_ERR_CRTL_TX_WARNING :
+					       CAN_ERR_CRTL_RX_WARNING;
 			cf->data[6] = txerr;
 			cf->data[7] = rxerr;
 		}
@@ -962,8 +1021,8 @@ static int phytium_can_open(struct net_device *dev)
 
 	ret = pm_runtime_get_sync(cdev->dev);
 	if (ret < 0) {
-		netdev_err(dev, "%s: pm_runtime_get failed(%d)\n",
-			   __func__, ret);
+		netdev_err(dev, "%s: pm_runtime_get failed(%d)\n", __func__,
+			   ret);
 		return ret;
 	}
 
@@ -1030,10 +1089,14 @@ static int phytium_can_close(struct net_device *dev)
  *
  * Return: 0 on success.
  */
-static netdev_tx_t phytium_can_start_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t phytium_can_start_xmit(struct sk_buff *skb,
+					  struct net_device *dev)
 {
+	u32 txerr;
 	struct phytium_can_dev *cdev = netdev_priv(dev);
-
+	const struct canfd_frame *cfd = (struct canfd_frame *)skb->data;
+	txerr = ((phytium_can_read(cdev, CAN_ERR_CNT) & ERR_CNT_TEC) >> 16);
+	skb->protocol = htons(ETH_P_CAN);
 	if (can_dropped_invalid_skb(dev, skb))
 		return NETDEV_TX_OK;
 
@@ -1080,8 +1143,28 @@ static int phytium_can_dev_setup(struct phytium_can_dev *cdev)
 	return 0;
 }
 
-struct phytium_can_dev *phytium_can_allocate_dev(struct device *dev, int sizeof_priv,
-						 int tx_fifo_depth)
+static void netlink_rcv_msg(struct sk_buff *skb)
+{
+    struct nlmsghdr *nlh = NULL;
+    char *umsg = NULL;
+
+    if(skb->len >= nlmsg_total_size(0))
+    {
+        nlh = nlmsg_hdr(skb);
+        umsg = NLMSG_DATA(nlh);
+        if(umsg) 
+        {
+            printk("kernel recv from user: %s\n", umsg);
+        }
+    }
+}
+
+struct netlink_kernel_cfg cfg = { 
+   .input  = netlink_rcv_msg, /* set recv callback */
+}; 
+
+struct phytium_can_dev *
+phytium_can_allocate_dev(struct device *dev, int sizeof_priv, int tx_fifo_depth)
 {
 	struct phytium_can_dev *cdev = NULL;
 	struct net_device *net_dev;
@@ -1098,6 +1181,9 @@ struct phytium_can_dev *phytium_can_allocate_dev(struct device *dev, int sizeof_
 	cdev->dev = dev;
 	SET_NETDEV_DEV(net_dev, dev);
 
+	if (!nl_sk){
+		nl_sk = netlink_kernel_create(&init_net, NETLINK_TEST, &cfg);
+	}
 out:
 	return cdev;
 }
@@ -1105,6 +1191,9 @@ EXPORT_SYMBOL(phytium_can_allocate_dev);
 
 void phytium_can_free_dev(struct net_device *net)
 {
+	if (nl_sk){
+	 	sock_release(nl_sk->sk_socket);
+	}
 	free_candev(net);
 }
 EXPORT_SYMBOL(phytium_can_free_dev);
@@ -1130,8 +1219,8 @@ int phytium_can_register(struct phytium_can_dev *cdev)
 
 	devm_can_led_init(cdev->net);
 
-	dev_info(cdev->dev, "%s device registered (irq=%d)\n",
-		 KBUILD_MODNAME, cdev->net->irq);
+	dev_info(cdev->dev, "%s device registered (irq=%d)\n", KBUILD_MODNAME,
+		 cdev->net->irq);
 
 	/* Probe finished
 	 * Stop clocks. They will be reactivated once the device is opened.
@@ -1190,10 +1279,35 @@ int phytium_can_resume(struct device *dev)
 
 	return 0;
 }
+
+
+
+// Initialize netlink
+// static int __init
+// netlink_init(void)
+// {
+	// nl_sk = netlink_kernel_create(&init_net, NETLINK_TEST, &cfg);
+	// if (!nl_sk) {
+	// 	printk(KERN_ERR "my_net_link: create netlink socket error.\n");
+	// 	return 1;
+	// }
+	// return 0;
+// }
+
+// static void __exit netlink_exit(void)
+// {
+	// if (nl_sk != NULL) {
+	// 	sock_release(nl_sk->sk_socket);
+	// }
+	// printk("my_net_link: self module exited\n");
+// }
+
+// module_init(netlink_init);
+// module_exit(netlink_exit);
+
 EXPORT_SYMBOL(phytium_can_resume);
 
 MODULE_AUTHOR("Cheng Quan <chengquan@phytium.com.cn>");
 MODULE_AUTHOR("Chen Baozi <chenbaozi@phytium.com.cn>");
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("CAN bus driver for Phytium CAN controller");
-
