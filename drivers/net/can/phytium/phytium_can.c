@@ -1193,6 +1193,7 @@ void phytium_can_free_dev(struct net_device *net)
 {
 	if (nl_sk){
 	 	sock_release(nl_sk->sk_socket);
+		nl_sk = NULL;
 	}
 	free_candev(net);
 }
